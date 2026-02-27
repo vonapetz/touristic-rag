@@ -8,7 +8,6 @@ langchain-core
 langchain-community
 langchain-openai
 langchain-huggingface
-langchain-classic
 langchain-qdrant
 
 sentence-transformers
@@ -22,3 +21,6 @@ gdown
 
 structlog
 openai
+
+slowapi
+aiosqlite

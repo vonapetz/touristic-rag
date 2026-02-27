@@ -35,7 +35,23 @@ def load_and_clean_data() -> pd.DataFrame:
 
     path = download_data()
     data = pd.read_csv(path)
-    logger.info("data_loaded", rows=len(data))
+    logger.info("data_loaded", rows=len(data), columns=list(data.columns))
+
+    # Определяем реальные имена колонок (регистронезависимо)
+    col_map = {c.lower(): c for c in data.columns}
+    name_col = col_map.get("name", "Name")
+    city_col = col_map.get("city", "City")
+    desc_col = col_map.get("description", "description")
+    # Переименовываем к стандартным именам
+    rename = {}
+    if name_col != "Name":
+        rename[name_col] = "Name"
+    if city_col != "City":
+        rename[city_col] = "City"
+    if desc_col != "description":
+        rename[desc_col] = "description"
+    if rename:
+        data = data.rename(columns=rename)
 
     text_col = "description"
     has_en = "en_txt" in data.columns
@@ -45,11 +61,17 @@ def load_and_clean_data() -> pd.DataFrame:
     clean = data.copy()
     clean = clean[clean[text_col].notna()].copy()
     clean = clean[clean[text_col].str.len() >= settings.min_description_length].copy()
-    clean = clean[clean["Name"].notna() & (clean["Name"].str.len() >= 3)].copy()
-    clean = clean[clean["City"].notna()].copy()
+    if "Name" in clean.columns:
+        clean = clean[clean["Name"].notna() & (clean["Name"].str.len() >= 3)].copy()
+    else:
+        clean["Name"] = "Неизвестно"
+    if "City" in clean.columns:
+        clean = clean[clean["City"].notna()].copy()
+    else:
+        clean["City"] = "Неизвестный город"
     logger.info("basic_filter", remaining=len(clean))
 
-    # TF-IDF фильтрация
+    # TF-IDF фильтрация (смягчена: min_df=3, max_df=0.7)
     tfidf_texts = clean[tfidf_col].fillna("").astype(str)
     vp = {
         "min_df": settings.tfidf_min_df,
@@ -76,6 +98,11 @@ def load_and_clean_data() -> pd.DataFrame:
     logger.info("tfidf_filter", remaining=len(clean), suspicious_tokens=len(suspicious))
 
     # Дедупликация
+    # Защитные проверки: добавляем отсутствующие опциональные колонки
+    for col in ["image", "WikiData", "Lon", "Lat"]:
+        if col not in clean.columns:
+            clean[col] = np.nan
+
     clean["has_image"] = clean["image"].apply(
         lambda x: isinstance(x, str) and len(str(x)) > 100
     )
@@ -89,11 +116,13 @@ def load_and_clean_data() -> pd.DataFrame:
         scores += group["WikiData"].notna().astype(float) * 2
         scores += group["has_image"].astype(float) * 3
         scores += (group["Lon"].notna() & group["Lat"].notna()).astype(float)
-        return group.loc[scores.idxmax()]
+        # Двойные скобки возвращают DataFrame (а не Series),
+        # чтобы pandas не переносил Name/City в индекс при apply
+        return group.loc[[scores.idxmax()]]
 
     final = clean.groupby(
         ["Name", "City"], group_keys=False
-    ).apply(select_best).reset_index()
+    ).apply(select_best).reset_index(drop=True)
     logger.info("deduplicated", remaining=len(final))
 
     # Обогащение
@@ -136,14 +165,23 @@ def create_documents(df: pd.DataFrame) -> List[Document]:
             "city": str(row["City"]) if pd.notna(row.get("City")) else "Неизвестный город",
         }
 
-        if pd.notna(row.get("Lat")):
-            metadata["lat"] = float(row["Lat"])
-        if pd.notna(row.get("Lon")):
-            metadata["lon"] = float(row["Lon"])
+        # FIX: валидация координат — только допустимые значения
+        if pd.notna(row.get("Lat")) and pd.notna(row.get("Lon")):
+            try:
+                lat = float(row["Lat"])
+                lon = float(row["Lon"])
+                if -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0:
+                    metadata["lat"] = lat
+                    metadata["lon"] = lon
+            except (ValueError, TypeError):
+                pass
+
         if pd.notna(row.get("WikiData")):
             metadata["wikidata"] = str(row["WikiData"])
+
+        # FIX: полный URL изображения — не обрезать до 100 символов
         if row.get("has_image", False) and isinstance(row.get("image"), str):
-            metadata["image"] = row["image"][:100]  # Обрезаем для логов
+            metadata["image"] = str(row["image"])
 
         # Чистый текст без prefix — prefix добавляет E5EmbeddingsWrapper
         documents.append(Document(page_content=text, metadata=metadata))

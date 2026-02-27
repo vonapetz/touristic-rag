@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-3.5-turbo"
     local_llm_url: str = "http://localhost:11434/v1"
     local_llm_model: str = "qwen3:14b"
-    llm_temperature: float = 0.3
+    llm_temperature: float = 0.1      # 0.3 → 0.1: меньше галлюцинаций
     llm_max_tokens: int = 1024
 
     # Embeddings
@@ -29,14 +29,19 @@ class Settings(BaseSettings):
     bm25_weight: float = 0.4
     vector_weight: float = 0.6
 
+    # Retrieval quality
+    max_context_chars: int = 3000         # было 1200 (hardcoded), улучшает Faithfulness
+    reranker_score_threshold: float = -2.0  # фильтрация нерелевантных после реранкинга
+    rrf_k: int = 60                       # параметр RRF (стандартное значение)
+
     # Qdrant
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: Optional[str] = None
     qdrant_collection: str = "landmarks"
 
-    # Reranker
-    reranker_type: str = Field("cross-encoder", description="'cohere', 'cross-encoder', 'none'")
-    cross_encoder_model: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
+    # Reranker — SOTA multilingual reranker 2024
+    reranker_type: str = Field("cross-encoder", description="'cross-encoder', 'none'")
+    cross_encoder_model: str = "BAAI/bge-reranker-v2-m3"
     cohere_api_key: Optional[str] = None
 
     # Data
@@ -50,12 +55,26 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_format: str = "json"
 
-    # Cleanup
-    tfidf_min_df: int = 10
-    tfidf_max_df: float = 0.1
+    # Cleanup — смягчены для 239 документов
+    tfidf_min_df: int = 3         # было 10
+    tfidf_max_df: float = 0.7     # было 0.1 (убивало общие туристические слова)
     tfidf_suspicious_low: float = 0.001
-    tfidf_suspicious_high: float = 50
+    tfidf_suspicious_high: float = 200  # было 50
     min_description_length: int = 10
+
+    # Caching
+    query_cache_ttl: int = 3600        # TTL кеша запросов в секундах
+    query_cache_max_size: int = 500    # макс. записей в кеше
+
+    # Persistence
+    feedback_db_path: str = "data/feedback.db"
+    bm25_cache_path: str = "data/processed/bm25.pkl"
+    force_rebuild_bm25: bool = False   # принудительно пересобрать BM25 индекс
+
+    # API / Security
+    cors_origins: list = ["*"]         # переопределить в prod: ["https://yourdomain.com"]
+    rate_limit: str = "20/minute"      # rate limit для /v1/query
+    debug_mode: bool = False           # включает /v1/debug/* endpoints
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
