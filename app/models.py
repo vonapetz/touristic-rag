@@ -18,6 +18,10 @@ class SourceInfo(BaseModel):
     lat: Optional[float] = None
     lon: Optional[float] = None
     relevance_rank: int
+    score: Optional[float] = None           # score от cross-encoder реранкера
+    text_snippet: Optional[str] = None      # первые 200 символов документа
+    image: Optional[str] = None             # полный URL изображения
+    wikidata: Optional[str] = None          # WikiData ID
 
 
 class ModelInfo(BaseModel):
@@ -30,18 +34,27 @@ class ModelInfo(BaseModel):
 class TimingInfo(BaseModel):
     total_sec: float
     retrieval_sec: float
-    reranking_sec: float
+    reranking_sec: float    # теперь реально измеряется
     llm_sec: float
 
 
 class QueryResponse(BaseModel):
-    query_id: str
+    query_id: str           # полный UUID v4
     question: str
     answer: str
     sources: List[SourceInfo] = []
     timing: TimingInfo
     model_info: ModelInfo
-    timestamp: str
+    timestamp: datetime
+    cached: bool = False    # True если ответ из кеша
+
+
+class StreamToken(BaseModel):
+    """Токен для SSE-стриминга."""
+    token: str
+    query_id: str
+    done: bool = False
+    sources: List[SourceInfo] = []   # заполняется только при done=True
 
 
 class FeedbackRequest(BaseModel):
@@ -56,10 +69,12 @@ class FeedbackResponse(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    status: str
+    status: str             # "healthy" | "degraded"
+    qdrant: str             # "ok" | "unreachable"
     documents: int
     llm_provider: str
     llm_model: str
     embedding_model: str
     reranker: str
     uptime_sec: float
+    cache_size: int

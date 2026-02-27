@@ -2,12 +2,15 @@
 Retrieval pipeline:
 1. Qdrant Vector Search (с нативной фильтрацией по метаданным)
 2. BM25 для keyword search
-3. Hybrid Ensemble (BM25 + Qdrant)
-4. Reranking (Cross-Encoder через sentence-transformers)
-5. Metadata-aware filtering (город из запроса)
+3. Hybrid Ensemble через Reciprocal Rank Fusion (SOTA)
+4. Reranking (Cross-Encoder) с score threshold
+5. Metadata-aware filtering (город из запроса) — теперь тоже реранкирует
 """
 
-from typing import List, Optional, Any
+import pickle
+import time
+from pathlib import Path
+from typing import List, Optional, Any, Tuple
 
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
@@ -90,40 +93,104 @@ class QdrantRetriever:
 
 
 # ============================================================================
-# Cross-Encoder Reranker (ручная реализация через sentence-transformers)
+# Cross-Encoder Reranker с score threshold
 # ============================================================================
 
 class ManualCrossEncoderReranker:
-    """Reranker через sentence-transformers CrossEncoder."""
+    """
+    Reranker через sentence-transformers CrossEncoder.
+    Возвращает (docs, scores) — score сохраняется в metadata для API.
+    Применяет score_threshold для отсева нерелевантных документов.
+    """
 
-    def __init__(self, model_name: str, top_n: int):
+    def __init__(self, model_name: str, top_n: int, score_threshold: float):
         from sentence_transformers import CrossEncoder
         logger.info("loading_cross_encoder", model=model_name)
         self.model = CrossEncoder(model_name)
         self.top_n = top_n
+        self.score_threshold = score_threshold
         logger.info("cross_encoder_loaded", model=model_name)
 
-    def rerank(self, query: str, documents: List[Document]) -> List[Document]:
+    def rerank(
+        self, query: str, documents: List[Document]
+    ) -> Tuple[List[Document], List[float]]:
+        """
+        Возвращает (docs, scores) отсортированных по релевантности.
+        Документы ниже score_threshold отфильтровываются, но не менее 1.
+        Score сохраняется в doc.metadata["reranker_score"] для API.
+        """
         if not documents:
-            return []
+            return [], []
 
         pairs = [[query, doc.page_content] for doc in documents]
-        scores = self.model.predict(pairs)
+        raw_scores = self.model.predict(pairs)
 
-        scored = list(zip(documents, scores))
-        scored.sort(key=lambda x: x[1], reverse=True)
+        # Сортировка по убыванию score
+        scored = sorted(zip(documents, raw_scores), key=lambda x: x[1], reverse=True)
 
-        return [doc for doc, _ in scored[:self.top_n]]
+        # Применяем threshold, но возвращаем минимум 1 документ
+        top = scored[:self.top_n]
+        filtered = [(d, float(s)) for d, s in top if s > self.score_threshold]
+        result = filtered if filtered else [(scored[0][0], float(scored[0][1]))]
+
+        docs_out = []
+        scores_out = []
+        for doc, score in result:
+            doc.metadata["reranker_score"] = round(score, 4)
+            docs_out.append(doc)
+            scores_out.append(score)
+
+        return docs_out, scores_out
 
 
 # ============================================================================
-# Hybrid Retriever с reranking
+# BM25 с кешированием на диск
+# ============================================================================
+
+def load_or_build_bm25(
+    documents: List[Document],
+    cache_path: str,
+    k: int,
+    force_rebuild: bool = False,
+) -> BM25Retriever:
+    """
+    Загружает BM25 индекс из pickle-файла или строит заново.
+    При force_rebuild=True всегда пересобирает.
+    """
+    path = Path(cache_path)
+
+    if not force_rebuild and path.exists():
+        try:
+            with open(path, "rb") as f:
+                retriever = pickle.load(f)
+            retriever.k = k
+            logger.info("bm25_loaded_from_cache", path=str(path))
+            return retriever
+        except Exception as e:
+            logger.warning("bm25_cache_load_failed", error=str(e), path=str(path))
+
+    retriever = BM25Retriever.from_documents(documents, k=k)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(path, "wb") as f:
+            pickle.dump(retriever, f)
+        logger.info("bm25_cached", path=str(path), docs=len(documents))
+    except Exception as e:
+        logger.warning("bm25_cache_save_failed", error=str(e))
+
+    return retriever
+
+
+# ============================================================================
+# Hybrid Retriever с RRF + Reranking
 # ============================================================================
 
 class HybridRetrieverWithRerank:
     """
-    BM25 + Qdrant → объединение → reranking.
-    Заменяет EnsembleRetriever + ContextualCompressionRetriever.
+    BM25 + Qdrant → RRF fusion → cross-encoder reranking.
+
+    Reciprocal Rank Fusion (RRF) — SOTA для гибридного поиска.
+    Не зависит от масштабов score разных систем.
     """
 
     def __init__(
@@ -131,51 +198,63 @@ class HybridRetrieverWithRerank:
         bm25: BM25Retriever,
         qdrant: QdrantRetriever,
         reranker: Optional[ManualCrossEncoderReranker],
-        bm25_weight: float,
-        vector_weight: float,
         k_initial: int,
         k_final: int,
+        rrf_k: int = 60,
     ):
         self.bm25 = bm25
         self.qdrant = qdrant
         self.reranker = reranker
-        self.bm25_weight = bm25_weight
-        self.vector_weight = vector_weight
         self.k_initial = k_initial
         self.k_final = k_final
+        self.rrf_k = rrf_k
 
-    def invoke(self, query: str) -> List[Document]:
-        # BM25 результаты
+    def _reciprocal_rank_fusion(
+        self, lists: List[List[Document]]
+    ) -> List[Document]:
+        """
+        Reciprocal Rank Fusion: score = sum(1 / (k + rank + 1)) по всем спискам.
+        Дедупликация по первым 200 символам контента.
+        """
+        scores: dict = {}
+        doc_map: dict = {}
+
+        for ranked_list in lists:
+            for rank, doc in enumerate(ranked_list):
+                key = doc.page_content[:200]
+                scores[key] = scores.get(key, 0.0) + 1.0 / (self.rrf_k + rank + 1)
+                if key not in doc_map:
+                    doc_map[key] = doc
+
+        sorted_keys = sorted(scores, key=lambda x: scores[x], reverse=True)
+        return [doc_map[k] for k in sorted_keys]
+
+    def invoke(self, query: str) -> Tuple[List[Document], dict]:
+        """
+        Возвращает (docs, timings) с раздельными retrieval_sec и reranking_sec.
+        """
+        t0 = time.perf_counter()
+
         bm25_results = self.bm25.invoke(query)
-
-        # Qdrant результаты (без фильтра по городу — это делает MetadataAwareRetriever)
         qdrant_results = self.qdrant.invoke(query, k=self.k_initial)
 
-        # Объединяем с дедупликацией
-        seen_texts = set()
-        merged = []
+        merged = self._reciprocal_rank_fusion([qdrant_results, bm25_results])
 
-        # Qdrant результаты первыми (выше вес)
-        for doc in qdrant_results:
-            text_key = doc.page_content[:100]
-            if text_key not in seen_texts:
-                seen_texts.add(text_key)
-                merged.append(doc)
+        t_rerank = time.perf_counter()
+        retrieval_sec = round(t_rerank - t0, 3)
 
-        # Дополняем BM25
-        for doc in bm25_results:
-            text_key = doc.page_content[:100]
-            if text_key not in seen_texts:
-                seen_texts.add(text_key)
-                merged.append(doc)
-
-        # Reranking
         if self.reranker and len(merged) > self.k_final:
-            merged = self.reranker.rerank(query, merged)
+            final_docs, _ = self.reranker.rerank(query, merged)
         else:
-            merged = merged[:self.k_final]
+            final_docs = merged[:self.k_final]
 
-        return merged
+        reranking_sec = round(time.perf_counter() - t_rerank, 3)
+
+        timings = {
+            "retrieval_sec": retrieval_sec,
+            "reranking_sec": reranking_sec,
+        }
+        return final_docs, timings
 
 
 # ============================================================================
@@ -183,7 +262,13 @@ class HybridRetrieverWithRerank:
 # ============================================================================
 
 class MetadataAwareRetriever:
-    """Retriever с автоматической фильтрацией по городу из запроса."""
+    """
+    Retriever с автоматической фильтрацией по городу из запроса.
+
+    FIX: city bypass теперь тоже проходит через реранкинг.
+    Было: city filter → сразу return (bypass reranking!)
+    Стало: city filter → k_initial документов → reranking → top k_final
+    """
 
     def __init__(
         self,
@@ -220,36 +305,64 @@ class MetadataAwareRetriever:
                 return city
         return None
 
-    def invoke(self, query: str) -> List[Document]:
+    def invoke(self, query: str) -> Tuple[List[Document], dict]:
+        """
+        Возвращает (docs, meta) где meta содержит path и timings.
+        """
         city = self._extract_city(query)
 
         if city:
-            # Нативный Qdrant фильтр — pre-filtering
+            # FIX: получаем k_initial документов через city filter
+            # и затем реранкируем — не bypass!
+            t0 = time.perf_counter()
             city_results = self.qdrant.invoke(
-                query, k=settings.retrieval_k_final, city_filter=city
+                query, k=self.hybrid.k_initial, city_filter=city
             )
-            if len(city_results) >= 2:
-                logger.debug("qdrant_native_filter", city=city, results=len(city_results))
-                return city_results
+            retrieval_sec = round(time.perf_counter() - t0, 3)
 
-        # Hybrid search (BM25 + Qdrant + reranking)
-        results = self.hybrid.invoke(query)
+            if len(city_results) >= self.hybrid.k_final:
+                t_rerank = time.perf_counter()
+                if self.hybrid.reranker:
+                    final_docs, _ = self.hybrid.reranker.rerank(query, city_results)
+                else:
+                    final_docs = city_results[:self.hybrid.k_final]
+                reranking_sec = round(time.perf_counter() - t_rerank, 3)
+
+                timings = {
+                    "retrieval_sec": retrieval_sec,
+                    "reranking_sec": reranking_sec,
+                }
+                logger.debug(
+                    "city_filter_path",
+                    city=city,
+                    candidates=len(city_results),
+                    final=len(final_docs),
+                )
+                return final_docs, {"path": "city_filter+rerank", "city": city, **timings}
+
+            # Fallback: city filter дал мало результатов — hybrid search
+            logger.debug("city_filter_fallback", city=city, results=len(city_results))
+
+        # Hybrid search (BM25 + Qdrant + RRF + reranking)
+        docs, timings = self.hybrid.invoke(query)
 
         logger.debug(
-            "metadata_filter",
+            "hybrid_path",
             city_extracted=city,
-            results_count=len(results),
+            results_count=len(docs),
         )
-
-        return results
+        return docs, {"path": "hybrid", "city": city, **timings}
 
 
 # ============================================================================
-# LangChain Wrapper
+# LangChain Wrapper с поддержкой timing
 # ============================================================================
 
 class RetrieverWrapper(BaseRetriever):
-    """Адаптер MetadataAwareRetriever → LangChain BaseRetriever."""
+    """
+    Адаптер MetadataAwareRetriever → LangChain BaseRetriever.
+    Добавляет метод invoke_with_timings для получения раздельных таймингов.
+    """
 
     _inner: Any = None
 
@@ -264,7 +377,17 @@ class RetrieverWrapper(BaseRetriever):
     def _get_relevant_documents(
         self, query: str, *, run_manager: CallbackManagerForRetrieverRun = None
     ) -> List[Document]:
-        return self._inner.invoke(query)
+        docs, _ = self._inner.invoke(query)
+        return docs
+
+    def invoke_with_timings(self, query: str) -> Tuple[List[Document], dict]:
+        """Возвращает (docs, timings) с retrieval_sec и reranking_sec."""
+        docs, meta = self._inner.invoke(query)
+        timings = {
+            "retrieval_sec": meta.get("retrieval_sec", 0.0),
+            "reranking_sec": meta.get("reranking_sec", 0.0),
+        }
+        return docs, timings
 
 
 # ============================================================================
@@ -285,8 +408,6 @@ def _init_qdrant_collection(
         info = client.get_collection(collection)
         if info.points_count > 0:
             logger.info("qdrant_collection_exists", collection=collection, points=info.points_count)
-
-            # Проверяем/создаём индексы на существующей коллекции
             _ensure_payload_indexes(client, collection)
             return
 
@@ -335,12 +456,11 @@ def _init_qdrant_collection(
 
     logger.info("qdrant_upload_complete", total_points=len(documents))
 
-    # Создаём payload индексы для фильтрации
     _ensure_payload_indexes(client, collection)
 
 
 def _ensure_payload_indexes(client: QdrantClient, collection: str):
-    """Создаёт payload индексы для полей, по которым будем фильтровать."""
+    """Создаёт payload индексы для полей фильтрации."""
 
     indexes_to_create = {
         "city": PayloadSchemaType.KEYWORD,
@@ -356,7 +476,6 @@ def _ensure_payload_indexes(client: QdrantClient, collection: str):
             )
             logger.info("payload_index_created", field=field_name, type=str(field_type))
         except Exception as e:
-            # Индекс уже существует — это нормально
             if "already exists" in str(e).lower() or "already indexed" in str(e).lower():
                 logger.debug("payload_index_exists", field=field_name)
             else:
@@ -386,31 +505,41 @@ def build_retrieval_pipeline(
     # Qdrant retriever
     qdrant_retriever = QdrantRetriever(client, embeddings, settings.qdrant_collection)
 
-    # BM25
-    bm25 = BM25Retriever.from_documents(documents, k=settings.retrieval_k_initial)
+    # BM25 с кешированием на диск
+    bm25 = load_or_build_bm25(
+        documents=documents,
+        cache_path=settings.bm25_cache_path,
+        k=settings.retrieval_k_initial,
+        force_rebuild=settings.force_rebuild_bm25,
+    )
 
-    # Reranker
+    # Reranker (SOTA: BAAI/bge-reranker-v2-m3)
     reranker = None
     if settings.reranker_type == "cross-encoder":
         try:
             reranker = ManualCrossEncoderReranker(
                 model_name=settings.cross_encoder_model,
                 top_n=settings.retrieval_k_final,
+                score_threshold=settings.reranker_score_threshold,
             )
         except Exception as e:
             logger.warning("reranker_load_failed", error=str(e))
 
-    # Hybrid retriever
+    # Hybrid retriever с RRF
     hybrid = HybridRetrieverWithRerank(
         bm25=bm25,
         qdrant=qdrant_retriever,
         reranker=reranker,
-        bm25_weight=settings.bm25_weight,
-        vector_weight=settings.vector_weight,
         k_initial=settings.retrieval_k_initial,
         k_final=settings.retrieval_k_final,
+        rrf_k=settings.rrf_k,
     )
-    logger.info("hybrid_retriever_built", bm25_w=settings.bm25_weight, vec_w=settings.vector_weight)
+    logger.info(
+        "hybrid_retriever_built",
+        fusion="RRF",
+        rrf_k=settings.rrf_k,
+        reranker=settings.cross_encoder_model if reranker else "none",
+    )
 
     # Metadata filter
     meta_retriever = MetadataAwareRetriever(hybrid, qdrant_retriever, documents)

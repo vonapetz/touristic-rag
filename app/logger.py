@@ -35,6 +35,8 @@ def setup_logging():
     )
 
     # Файловый handler
+    import os
+    os.makedirs("logs", exist_ok=True)
     file_handler = logging.FileHandler("logs/app.log", encoding="utf-8")
     file_handler.setLevel(log_level)
 
